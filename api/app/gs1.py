@@ -11,19 +11,29 @@
     010950600013435210INK2407\\x1d17280930
 
    定长 AI 按表消费固定字符数；变长 AI 消费到 FNC1 或字符串末尾。
-   扫码枪常附加的回车后缀（\\r / \\n）与 GS1 符号标识符前缀（如 ]d2）会被容忍。
+   扫码枪常附加的单个行尾（CRLF / CR / LF）与 GS1 符号标识符前缀（如 ]d2）
+   会被容忍；尾随空格、尾随制表符不属于扫描器噪声，绝不删除。
 
 无论哪种格式，都按 AI 的定长/变长规则解析后生成统一批次信息：
 商品编码 GTIN（AI 01，校验 GS1 校验位）、批号（AI 10）、
 失效日期（AI 17，YYMMDD，校验真实日历日期；按 GS1 规范 DD=00 表示当月最后一天）。
 
+字段值必须**逐字符可编码**到标签：仅允许 GS1 标签可承载的单字节 ASCII 字符
+（数字字段另限 0–9）。emoji、NUL、制表符、换行等字符集外内容一律定位到该字符并
+拒绝；长度按可编码字符（= 单字节字符）计数，多字节 Unicode 不会被少计而越界放行。
+
+对扫描器环境只做既有约定的两处容忍：**AIM 符号标识符前缀**与**单个行尾序列
+（\\r\\n / \\r / \\n）**。尾随空格、尾随制表符属于字段值/字段内容本身，绝不删除，
+因此两个仅尾随空格不同的批号不会得到同一批次结果。
+
 解析失败抛出 :class:`Gs1ParseError`，携带首个无法解析的字符位置（相对原始输入，
-从 0 计），供前端在原文中高亮定位。
+从 0 计）和机器可读错误代码，供前端在原文中高亮定位。
 """
 
 from __future__ import annotations
 
 import calendar
+import re
 from dataclasses import dataclass
 from datetime import date
 
@@ -33,22 +43,63 @@ GS = "\x1d"
 # 扫码枪可能带出的 AIM 符号标识符前缀（GS1 体系）
 _SYMBOLOGY_PREFIXES = ("]d2", "]C1", "]e0", "]Q3")
 
-# 扫码枪常见的回车后缀
-_TRAILING_NOISE = "\r\n\t "
+# 扫描器行尾：只容忍一个位于最末尾的行尾序列（CRLF / CR / LF），
+# 它是键盘模拟扫描器的按键后缀，不是标签数据。绝不包含空格与制表符。
+_SCANNER_EOL = re.compile(r"(?:\r\n|\r|\n)\Z")
 
 # GS1 数字字段只允许 ASCII 数字 0–9。
 # str.isdigit()/int() 会接受阿拉伯文数字（٠١٢…）、全角数字（０１２…）等
 # Unicode 数字，必须显式限定字符集，否则这类标签会被错误识别。
 _ASCII_DIGITS = frozenset("0123456789")
 
+# 标签可编码字符集：可打印 ASCII（0x20–0x7E，含空格），即 Code 128
+# 单码位可承载的内容。每个字符恰好占一个标签码位，因此长度按字符计数
+# 与按可编码承载量计数一致；字符集外（控制字符、DEL、emoji 等多字节
+# Unicode 内容）一律拒绝，而不是按 Unicode 字符数少计后放行。
+_PRINTABLE_ASCII = frozenset(chr(c) for c in range(0x20, 0x7F))
+
+
+# 机器可读错误代码（422 响应同步返回，供自动化验收逐项核对）
+CODE_PARSE_ERROR = "parse_error"  # 结构/长度等解析错误
+CODE_UNSUPPORTED_CHARACTER = "unsupported_character"  # 标签字符集外字符
+CODE_INVALID_CHECKSUM = "invalid_checksum"  # GTIN 校验位错误
+CODE_INVALID_DATE = "invalid_date"  # 失效日期不是真实日历日期
+CODE_MISSING_FIELD = "missing_field"  # 缺少必需 AI
+CODE_DUPLICATE_FIELD = "duplicate_field"  # 同一 AI 重复
+CODE_EMPTY_LABEL = "empty_label"  # 标签内容为空
+
+
+def _describe_character(ch: str) -> str:
+    """给出字符的人类可读名称，避免控制字符在错误文本中不可见。"""
+    names = {
+        "\x00": "NUL",
+        "\t": "制表符 TAB",
+        "\n": "换行 LF",
+        "\r": "回车 CR",
+        GS: "FNC1(GS)",
+        "\x7f": "DEL",
+        " ": "空格",
+    }
+    if ch in names:
+        return names[ch]
+    code = ord(ch)
+    if code < 0x20:
+        return f"控制字符 U+{code:04X}"
+    if code >= 0x7F:
+        return f"U+{code:04X}（不在 GS1 标签可编码字符集内）"
+    return f"{ch!r}"
+
 
 class Gs1ParseError(ValueError):
     """标签解析失败；position 为首个无法解析的字符在原始输入中的下标（0 起）。"""
 
-    def __init__(self, message: str, position: int) -> None:
+    def __init__(
+        self, message: str, position: int, code: str = CODE_PARSE_ERROR
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.position = position
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -115,7 +166,29 @@ class ParsedField:
 
 
 def _validate_value(spec: AiSpec, value: str, pos: int) -> None:
-    """按定长/变长与字符集规则校验一个字段值，pos 为值起始下标。"""
+    """按字符集与定长/变长规则校验一个字段值，pos 为值起始下标。
+
+    先逐字符校验可编码性（数字字段另限 ASCII 0–9，其余字段允许可打印 ASCII），
+    再校验长度：字符集检查通过的每个字符恰好占一个标签码位，``len(value)``
+    就是真实可承载长度，多字节 Unicode 无法少计长度蒙混过关。
+    """
+    for k, ch in enumerate(value):
+        if spec.numeric:
+            if ch not in _ASCII_DIGITS:
+                raise Gs1ParseError(
+                    f"AI ({spec.ai}) {spec.label}应为纯数字（仅限 0-9），"
+                    f"此处出现 {_describe_character(ch)}",
+                    pos + k,
+                    CODE_UNSUPPORTED_CHARACTER,
+                )
+        elif ch not in _PRINTABLE_ASCII:
+            raise Gs1ParseError(
+                f"AI ({spec.ai}) {spec.label}出现标签无法编码的字符："
+                f"{_describe_character(ch)}（允许可打印 ASCII 0x20–0x7E，含空格）",
+                pos + k,
+                CODE_UNSUPPORTED_CHARACTER,
+            )
+
     if spec.fixed is not None:
         if len(value) != spec.fixed:
             raise Gs1ParseError(
@@ -124,19 +197,16 @@ def _validate_value(spec: AiSpec, value: str, pos: int) -> None:
             )
     else:
         if len(value) == 0:
-            raise Gs1ParseError(f"AI ({spec.ai}) {spec.label}为变长字段，内容为空", pos)
+            raise Gs1ParseError(
+                f"AI ({spec.ai}) {spec.label}为变长字段，内容为空",
+                pos,
+            )
         if len(value) > spec.max_len:
             raise Gs1ParseError(
-                f"AI ({spec.ai}) {spec.label}最长 {spec.max_len} 位，实际 {len(value)} 位",
+                f"AI ({spec.ai}) {spec.label}最长 {spec.max_len} 位（按可编码字符计），"
+                f"实际 {len(value)} 位",
                 pos + spec.max_len,
             )
-    if spec.numeric:
-        for k, ch in enumerate(value):
-            if ch not in _ASCII_DIGITS:
-                raise Gs1ParseError(
-                    f"AI ({spec.ai}) {spec.label}应为纯数字（仅限 0-9），此处出现 {ch!r}",
-                    pos + k,
-                )
 
 
 def _parse_readable(text: str, base: int) -> list[ParsedField]:
@@ -223,6 +293,7 @@ def _check_gtin(value: str, pos: int) -> None:
         raise Gs1ParseError(
             f"商品编码校验位错误：按前 {n - 1} 位计算应为 {expected}，实际为 {digits[-1]}",
             pos + n - 1,
+            CODE_INVALID_CHECKSUM,
         )
 
 
@@ -242,7 +313,11 @@ def _parse_expiry(value: str, pos: int) -> str:
     yy, mm, dd = int(value[0:2]), int(value[2:4]), int(value[4:6])
     year = _resolve_year(yy)
     if not 1 <= mm <= 12:
-        raise Gs1ParseError(f"失效日期月份 {mm:02d} 不存在（允许 01–12）", pos + 2)
+        raise Gs1ParseError(
+            f"失效日期月份 {mm:02d} 不存在（允许 01–12）",
+            pos + 2,
+            CODE_INVALID_DATE,
+        )
     last_day = calendar.monthrange(year, mm)[1]
     if dd == 0:
         day = last_day  # GS1 规范：日字段 00 表示当月最后一天
@@ -251,6 +326,7 @@ def _parse_expiry(value: str, pos: int) -> str:
             f"失效日期 {year}-{mm:02d}-{dd:02d} 不是真实日历日期"
             f"（该月只有 {last_day} 天）",
             pos + 4,
+            CODE_INVALID_DATE,
         )
     else:
         day = dd
@@ -263,7 +339,9 @@ def _build_batch(fields: list[ParsedField], end_pos: int) -> dict[str, str]:
     for field in fields:
         if field.ai in by_ai:
             raise Gs1ParseError(
-                f"应用标识符 ({field.ai}) {field.label}重复出现", field.position
+                f"应用标识符 ({field.ai}) {field.label}重复出现",
+                field.position,
+                CODE_DUPLICATE_FIELD,
             )
         by_ai[field.ai] = field
 
@@ -271,7 +349,9 @@ def _build_batch(fields: list[ParsedField], end_pos: int) -> dict[str, str]:
         if ai not in by_ai:
             label = AI_SPECS[ai].label
             raise Gs1ParseError(
-                f"标签缺少批次核验必需的 AI ({ai}) {label}", end_pos
+                f"标签缺少批次核验必需的 AI ({ai}) {label}",
+                end_pos,
+                CODE_MISSING_FIELD,
             )
 
     gtin = by_ai["01"]
@@ -303,11 +383,14 @@ def parse_gs1_label(raw: str) -> dict[str, object]:
             text = text[len(prefix) :]
             base += len(prefix)
             break
-    # 容忍扫码枪附加的回车后缀；只裁尾部，位置下标仍与原文对齐
-    text = text.rstrip(_TRAILING_NOISE)
+    # 只容忍一个扫描器行尾序列（CRLF/CR/LF）；尾随空格、制表符等一律保留，
+    # 它们是字段值的一部分，删除会让不同批号（如 "INK2407" 与 "INK2407 "）
+    # 得到同一批次结果。位置下标仍与原文对齐。
+    text = _SCANNER_EOL.sub("", text, count=1)
 
-    if not text:
-        raise Gs1ParseError("标签内容为空", base)
+    # 纯空白（仅空格/制表符，或空串）没有可解析内容，按空标签拒绝。
+    if not text or not text.strip():
+        raise Gs1ParseError("标签内容为空", base, CODE_EMPTY_LABEL)
 
     if text.startswith("("):
         fmt = "readable"

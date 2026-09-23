@@ -131,9 +131,14 @@ def gs1_label(req: Gs1LabelRequest) -> Any:
             status_code=422,
             content={
                 "ok": False,
+                "code": exc.code,
                 "message": f"标签解析失败：{exc.message}",
                 "errors": [
-                    {"field": "raw", "message": exc.message, "type": "parse_error"}
+                    {
+                        "field": "raw",
+                        "message": exc.message,
+                        "type": exc.code,
+                    }
                 ],
                 "position": exc.position,
             },

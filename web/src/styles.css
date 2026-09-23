@@ -345,3 +345,9 @@ button:disabled {
   font-variant-numeric: tabular-nums;
   word-break: break-all;
 }
+
+/* 逐字符展示后端返回值：保留尾随空格（显式渲染为 ␠），不被 HTML 折叠 */
+.label-result dd.verbatim-value {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}

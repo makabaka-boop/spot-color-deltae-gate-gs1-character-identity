@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BatchLabelPanel } from "./BatchLabelPanel";
@@ -294,5 +294,138 @@ describe("批次标签核验区状态机", () => {
 
     expect(await screen.findByTestId("label-error")).toBeInTheDocument();
     expect(screen.getByTestId("label-error-char")).toHaveTextContent("末尾");
+  });
+
+  it("批号含尾随空格：逐字符展示空格为 ␠，与无尾随空格的批号可区分", async () => {
+    const user = userEvent.setup();
+    mockResponse(async () =>
+      jsonResponse(200, {
+        ok: true,
+        format: "scan",
+        fields: [],
+        batch: { gtin: "09506000134352", lot: "INK2407 ", expires: "2028-09-30" },
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), "01095060001343521728093010INK2407 ");
+    await user.click(screen.getByTestId("label-verify"));
+
+    const lot = await screen.findByTestId("label-lot");
+    // 尾随空格被显式渲染为 ␠，不会被 HTML 折叠而与 "INK2407" 显示相同
+    expect(lot).toHaveTextContent("INK2407␠");
+    expect(lot.textContent).toBe("INK2407␠");
+    expect(lot.textContent).not.toBe("INK2407");
+    // white-space: pre-wrap 防止空格折叠
+    expect(lot.className).toContain("verbatim-value");
+  });
+
+  it("批号含中部与尾随空格：每个空格都可见", async () => {
+    const user = userEvent.setup();
+    mockResponse(async () =>
+      jsonResponse(200, {
+        ok: true,
+        format: "readable",
+        fields: [],
+        batch: { gtin: "09506000134352", lot: "A B  ", expires: "2028-09-30" },
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), "(01)09506000134352(17)280930(10)A B  ");
+    await user.click(screen.getByTestId("label-verify"));
+
+    expect(await screen.findByTestId("label-lot")).toHaveTextContent("A␠B␠␠");
+  });
+
+  it("末尾制表符被拒绝：错误码 unsupported_character，制表符在原文中可见且被高亮", async () => {
+    const user = userEvent.setup();
+    const raw = "(01)09506000134352(17)280930(10)INK2407\t";
+    mockResponse(async () =>
+      jsonResponse(422, {
+        ok: false,
+        code: "unsupported_character",
+        message: "标签解析失败：AI (10) 批号出现标签无法编码的字符：制表符 TAB",
+        errors: [
+          { field: "raw", message: "无法编码的字符", type: "unsupported_character" },
+        ],
+        position: raw.length - 1,
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), raw);
+    await user.click(screen.getByTestId("label-verify"));
+
+    await screen.findByTestId("label-error");
+    expect(screen.getByTestId("label-status")).toHaveTextContent("已拒绝");
+    // 制表符以可见字形 ␉ 出现，并恰好是被高亮的字符（不是不可见/被吞掉）
+    expect(screen.getByTestId("label-error-char")).toHaveTextContent("␉");
+    expect(screen.getByTestId("label-raw-highlight")).toHaveTextContent(
+      "(01)09506000134352(17)280930(10)INK2407␉",
+    );
+  });
+
+  it("NUL / 换行 / GS 等控制字符在错误原文中均有唯一可见字形，不折行混淆", async () => {
+    const user = userEvent.setup();
+    // 注：textarea 的值规范化会把孤立 \r 归一成 \n（浏览器行为一致），扫描器的
+    // 末尾 \r 后缀由后端容忍，故此处覆盖能进入输入框的 NUL / LF / GS。
+    const cases: Array<{ ch: string; glyph: string }> = [
+      { ch: "\x00", glyph: "␀" },
+      { ch: "\n", glyph: "␊" },
+      { ch: "\x1d", glyph: "␝" },
+    ];
+    for (const { ch, glyph } of cases) {
+      const raw = `(01)09506000134352(17)280930(10)AB${ch}CD`;
+      mockResponse(async () =>
+        jsonResponse(422, {
+          ok: false,
+          code: "unsupported_character",
+          message: "标签解析失败：出现标签无法编码的字符",
+          errors: [
+            { field: "raw", message: "x", type: "unsupported_character" },
+          ],
+          position: raw.indexOf(ch),
+        }),
+      );
+
+      const { unmount } = render(<BatchLabelPanel />);
+      // 直接以 change 事件写入扫码枪原文（可含 \r / NUL；键盘录入会被浏览器归一化）
+      fireEvent.change(screen.getByTestId("label-raw"), { target: { value: raw } });
+      await user.click(screen.getByTestId("label-verify"));
+      await screen.findByTestId("label-error");
+
+      expect(screen.getByTestId("label-error-char")).toHaveTextContent(glyph);
+      expect(screen.getByTestId("label-raw-highlight")).toHaveTextContent(
+        `(01)09506000134352(17)280930(10)AB${glyph}CD`,
+      );
+      unmount();
+    }
+  });
+
+  it("emoji 等星平面字符：按码点定位，高亮块恰好覆盖该 emoji（不错位）", async () => {
+    const user = userEvent.setup();
+    const raw = "(01)09506000134352(17)280930(10)L😀X";
+    mockResponse(async () =>
+      jsonResponse(422, {
+        ok: false,
+        code: "unsupported_character",
+        message: "标签解析失败：出现标签无法编码的字符：U+1F600",
+        errors: [
+          { field: "raw", message: "x", type: "unsupported_character" },
+        ],
+        position: Array.from(raw).indexOf("😀"),
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), raw);
+    await user.click(screen.getByTestId("label-verify"));
+    await screen.findByTestId("label-error");
+
+    expect(screen.getByTestId("label-error-char")).toHaveTextContent("😀");
+    expect(screen.getByTestId("label-raw-highlight")).toHaveTextContent(
+      "(01)09506000134352(17)280930(10)L😀X",
+    );
   });
 });

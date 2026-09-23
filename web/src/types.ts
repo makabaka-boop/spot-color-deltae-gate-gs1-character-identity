@@ -73,6 +73,8 @@ export interface Gs1LabelErrorResponse {
   ok: false;
   message: string;
   errors: FieldError[];
+  /** 机器可读错误代码：parse_error / unsupported_character / invalid_checksum / invalid_date / missing_field / duplicate_field / empty_label */
+  code?: string;
   /** 首个无法解析的字符在原文中的下标（0 起）；无法定位时为 null */
   position: number | null;
 }
