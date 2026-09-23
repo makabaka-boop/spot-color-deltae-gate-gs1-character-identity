@@ -11,7 +11,22 @@
     010950600013435210INK2407\\x1d17280930
 
    定长 AI 按表消费固定字符数；变长 AI 消费到 FNC1 或字符串末尾。
-   扫码枪常附加的回车后缀（\\r / \\n）与 GS1 符号标识符前缀（如 ]d2）会被容忍。
+   扫码枪常附加的行尾后缀（\\r / \\n）与 GS1 符号标识符前缀（如 ]d2）会被容忍。
+
+字符集规则（GS1 General Specifications 82 字符字母数字集 = ASCII 0x20–0x7E）：
+
+* 数字 AI 仅接受半角数字 0–9；
+* 字母数字变长 AI（批号 10、序列号 21、企业内部 90–99 等）接受 0x20–0x7E，
+  即空格、标点、0–9、A–Z、a–z，**空格属于合法字符且含身份**：字段末尾的空格
+  不会被剥离（只有整个标签最末尾的 \\r/\\n 扫码行尾会被容忍）；
+* 其余一切字符（emoji、NUL、TAB、换行、DEL、非 ASCII 字母/数字等）都按
+  GS1 字符集外内容**定位到该字符稳定拒绝**，绝不静默改写或放行。
+* 长度按可编码标签内容计数：字符集外的多字节字符在长度检查前即被拒绝，
+  因而字符数与 GS1-128 实际承载的符号字符数一致，不会出现“按 Unicode 码点
+  计数而超界仍识别”。
+
+可读格式中 '(' 与 ')' 是结构性定界符，不属于任何字段值；扫描格式中 GS(0x1D)
+是分隔符。字段值中部出现 TAB 与字段末尾出现 TAB 一视同仁：均为字符集外字符。
 
 无论哪种格式，都按 AI 的定长/变长规则解析后生成统一批次信息：
 商品编码 GTIN（AI 01，校验 GS1 校验位）、批号（AI 10）、
@@ -30,25 +45,41 @@ from datetime import date
 # FNC1 在扫码枪输出中的传输字符（Group Separator）
 GS = "\x1d"
 
-# 扫码枪可能带出的 AIM 符号标识符前缀（GS1 体系）
+# 扫码枪可能带出的 AIM 符号标识符前缀（ISO/IEC 15424，GS1 体系码制）
 _SYMBOLOGY_PREFIXES = ("]d2", "]C1", "]e0", "]Q3")
 
-# 扫码枪常见的回车后缀
-_TRAILING_NOISE = "\r\n\t "
+# 仅容忍真正的扫码枪行尾后缀（整串末尾的 CR/LF）。
+# 注意：空格与 TAB 绝不能列入——带空格的变长字段（如批号）放在末尾时，
+# 尾随空格是字段值的一部分；与行尾一起剥离会让两个不同批号得到同一结果。
+# 末尾 TAB 也不是扫码行尾，必须与字段中部 TAB 一样按字符集外字符拒绝。
+_TRAILING_LINE_ENDINGS = "\r\n"
 
 # GS1 数字字段只允许 ASCII 数字 0–9。
 # str.isdigit()/int() 会接受阿拉伯文数字（٠١٢…）、全角数字（０１２…）等
 # Unicode 数字，必须显式限定字符集，否则这类标签会被错误识别。
 _ASCII_DIGITS = frozenset("0123456789")
 
+# GS1 字母数字字符集（General Specifications 表 7.11–1 的 82 字符集）：
+# 所有可打印 ASCII 字符 0x20–0x7E（含空格与标点），码点即条码承载的符号字符，
+# 长度按此计数与实际承载一致。
+_GS1_ALNUM_MIN, _GS1_ALNUM_MAX = 0x20, 0x7E
+
+# 机器可读错误代码：调用方（自动化验收）据此逐项核对失败类别，
+# 不再依赖中文 message 子串。
+ERR_UNSUPPORTED_CHAR = "unsupported_character"
+
 
 class Gs1ParseError(ValueError):
-    """标签解析失败；position 为首个无法解析的字符在原始输入中的下标（0 起）。"""
+    """标签解析失败；position 为首个无法解析的字符在原始输入中的下标（0 起）。
 
-    def __init__(self, message: str, position: int) -> None:
+    code 为稳定错误代码（默认 parse_error；字符集外字符为 unsupported_character）。
+    """
+
+    def __init__(self, message: str, position: int, code: str = "parse_error") -> None:
         super().__init__(message)
         self.message = message
         self.position = position
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -114,29 +145,69 @@ class ParsedField:
     position: int  # 值在原始输入中的起始下标（0 起）
 
 
+def _describe_char(ch: str) -> str:
+    """描述一个字符集外字符，控制字符给出 U+XXXX 与名称线索，避免不可见呈现。"""
+    cp = ord(ch)
+    if cp < 0x20:
+        names = {
+            0x00: "NUL",
+            0x09: "TAB",
+            0x0A: "LF(换行)",
+            0x0D: "CR(回车)",
+            0x1D: "GS(FNC1)",
+        }
+        name = names.get(cp, "控制字符")
+        return f"U+{cp:04X} {name}"
+    if cp == 0x7F:
+        return "U+007F DEL"
+    return f"U+{cp:04X} {ch!r}"
+
+
 def _validate_value(spec: AiSpec, value: str, pos: int) -> None:
-    """按定长/变长与字符集规则校验一个字段值，pos 为值起始下标。"""
+    """按字符集与定长/变长规则校验一个字段值，pos 为值起始下标。
+
+    字符集检查先于长度检查：字符集外字符（可能是多字节）按其所在位置拒绝，
+    保证长度只对可编码标签内容计数；首个问题字符的位置即返回位置。
+    """
+    if len(value) == 0:
+        if spec.fixed is not None:
+            raise Gs1ParseError(
+                f"AI ({spec.ai}) {spec.label}为定长 {spec.fixed} 位，实际 0 位",
+                pos,
+            )
+        raise Gs1ParseError(f"AI ({spec.ai}) {spec.label}为变长字段，内容为空", pos)
+
+    if spec.numeric:
+        for k, ch in enumerate(value):
+            if ch not in _ASCII_DIGITS:
+                raise Gs1ParseError(
+                    f"AI ({spec.ai}) {spec.label}应为纯数字（仅限 0-9），"
+                    f"此处出现 GS1 字符集外字符 {_describe_char(ch)}",
+                    pos + k,
+                    code=ERR_UNSUPPORTED_CHAR,
+                )
+    else:
+        for k, ch in enumerate(value):
+            if not (_GS1_ALNUM_MIN <= ord(ch) <= _GS1_ALNUM_MAX):
+                raise Gs1ParseError(
+                    f"AI ({spec.ai}) {spec.label}含 GS1 字符集外字符"
+                    f"（仅允许 ASCII 0x20–0x7E，空格允许且含尾随空格）："
+                    f"{_describe_char(ch)}",
+                    pos + k,
+                    code=ERR_UNSUPPORTED_CHAR,
+                )
+
     if spec.fixed is not None:
         if len(value) != spec.fixed:
             raise Gs1ParseError(
                 f"AI ({spec.ai}) {spec.label}为定长 {spec.fixed} 位，实际 {len(value)} 位",
                 pos,
             )
-    else:
-        if len(value) == 0:
-            raise Gs1ParseError(f"AI ({spec.ai}) {spec.label}为变长字段，内容为空", pos)
-        if len(value) > spec.max_len:
-            raise Gs1ParseError(
-                f"AI ({spec.ai}) {spec.label}最长 {spec.max_len} 位，实际 {len(value)} 位",
-                pos + spec.max_len,
-            )
-    if spec.numeric:
-        for k, ch in enumerate(value):
-            if ch not in _ASCII_DIGITS:
-                raise Gs1ParseError(
-                    f"AI ({spec.ai}) {spec.label}应为纯数字（仅限 0-9），此处出现 {ch!r}",
-                    pos + k,
-                )
+    elif len(value) > spec.max_len:
+        raise Gs1ParseError(
+            f"AI ({spec.ai}) {spec.label}最长 {spec.max_len} 位，实际 {len(value)} 位",
+            pos + spec.max_len,
+        )
 
 
 def _parse_readable(text: str, base: int) -> list[ParsedField]:
@@ -303,8 +374,10 @@ def parse_gs1_label(raw: str) -> dict[str, object]:
             text = text[len(prefix) :]
             base += len(prefix)
             break
-    # 容忍扫码枪附加的回车后缀；只裁尾部，位置下标仍与原文对齐
-    text = text.rstrip(_TRAILING_NOISE)
+    # 只容忍真正的扫码枪行尾后缀（整串末尾的 CR/LF）；
+    # 不剥离空格与 TAB——末尾变长字段的尾随空格是字段值，TAB 属字符集外字符。
+    # 只裁整串末尾，位置下标仍与原文对齐。
+    text = text.rstrip(_TRAILING_LINE_ENDINGS)
 
     if not text:
         raise Gs1ParseError("标签内容为空", base)

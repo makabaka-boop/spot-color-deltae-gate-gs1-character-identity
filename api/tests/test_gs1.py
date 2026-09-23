@@ -294,15 +294,24 @@ def test_duplicate_ai_rejected() -> None:
     assert body["position"] == 22  # 第二个 (01) 的值起始处
 
 
-def test_empty_and_blank_raw_rejected() -> None:
+def test_empty_raw_rejected() -> None:
     status, body = _post("")
     assert status == 422  # pydantic min_length
 
-    status, body = _post("   ")
+
+def test_blank_spaces_are_data_not_noise_rejected_at_first_char() -> None:
+    """纯空格不是“空标签”：空格是 GS1 合法字符但不能构成 AI，按首字符拒绝。
+
+    旧实现把空格列入尾部噪声并剥离，得到“标签内容为空”；这会顺带吞掉末尾
+    变长字段的尾随空格（使两个批号合并为同一批次），新实现必须如此拒绝。
+    """
+    raw = "   "
+    status, body = _post(raw)
     assert status == 422
     assert body["ok"] is False
-    assert "为空" in body["message"]
+    assert body["code"] == "parse_error"
     assert body["position"] == 0
+    assert raw[body["position"]] == " "
 
 
 def test_request_shape_validation() -> None:
@@ -326,6 +335,303 @@ def test_error_response_keeps_field_error_shape() -> None:
     assert body["errors"][0]["field"] == "raw"
     assert body["errors"][0]["message"]
     assert isinstance(body["position"], int)
+
+
+# ── 尾随空格：字段身份逐字符保留，两种格式都不得剥离 ─────────────────────
+# 带空格的变长字段（批号 10）放在末尾时，尾随空格若被连同扫码枪后缀删除，
+# "INK2407 " 会与 "INK2407" 得到同一批次——这是必须杜绝的数据改写。
+
+def test_trailing_space_in_last_variable_field_readable_is_identity() -> None:
+    raw = f"(01){GTIN}(17)280930(10)INK2407 "
+    status, body = _post(raw)
+    assert status == 200
+    assert body["batch"]["lot"] == "INK2407 "
+
+
+def test_trailing_space_in_last_variable_field_scan_is_identity() -> None:
+    raw = f"01{GTIN}1728093010INK2407 "
+    status, body = _post(raw)
+    assert status == 200
+    assert body["batch"]["lot"] == "INK2407 "
+
+
+def test_two_lots_distinguished_by_trailing_space_both_formats() -> None:
+    """两个不同批号（仅尾随空格不同）必须得到不同批次结果。"""
+    lots: dict[str, str] = {}
+    for raw in (
+        f"(01){GTIN}(17)280930(10)INK2407",
+        f"(01){GTIN}(17)280930(10)INK2407 ",
+        f"01{GTIN}1728093010INK2407",
+        f"01{GTIN}1728093010INK2407 ",
+    ):
+        status, body = _post(raw)
+        assert status == 200, raw
+        lots[raw] = body["batch"]["lot"]
+    assert lots[f"(01){GTIN}(17)280930(10)INK2407"] == "INK2407"
+    assert lots[f"(01){GTIN}(17)280930(10)INK2407 "] == "INK2407 "
+    assert (
+        lots[f"(01){GTIN}(17)280930(10)INK2407"]
+        != lots[f"(01){GTIN}(17)280930(10)INK2407 "]
+    )
+
+
+def test_leading_and_middle_spaces_in_lot_preserved() -> None:
+    raw = f"(01){GTIN}(10) LOT A 1 (17)280930"
+    status, body = _post(raw)
+    assert status == 200
+    assert body["batch"]["lot"] == " LOT A 1 "
+
+
+def test_trailing_space_then_crlf_scanner_suffix_both_preserved() -> None:
+    """末尾变长字段值含尾随空格，扫码枪再附加 CRLF 行尾：空格保留、行尾容忍。"""
+    status, body = _post(f"01{GTIN}1728093010INK2407 \r\n")
+    assert status == 200
+    assert body["batch"]["lot"] == "INK2407 "
+
+    status, body = _post(f"(01){GTIN}(17)280930(10)INK2407 \n")
+    assert status == 200
+    assert body["batch"]["lot"] == "INK2407 "
+
+
+def test_fnc1_terminated_variable_field_trailing_space_preserved() -> None:
+    """字段不以整串结尾时，FNC1 前的尾随空格同样是值。"""
+    raw = f"01{GTIN}10INK2407 \x1d17280930"
+    status, body = _post(raw)
+    assert status == 200
+    assert body["batch"]["lot"] == "INK2407 "
+
+
+# ── TAB：字段中部与末尾语义一致（均为字符集外字符，稳定拒绝） ────────────
+
+def test_tab_at_end_of_lot_rejected_at_tab_position_both_formats() -> None:
+    raw = f"(01){GTIN}(17)280930(10)INK2407\t"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == len(raw) - 1
+    assert raw[body["position"]] == "\t"
+
+    raw = f"01{GTIN}1728093010INK2407\t"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == len(raw) - 1
+    assert raw[body["position"]] == "\t"
+
+
+def test_tab_in_middle_of_lot_rejected_at_tab_position_both_formats() -> None:
+    readable = f"(01){GTIN}(10)INK\t2407(17)280930"
+    status, body = _post(readable)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == readable.index("\t")
+    assert readable[body["position"]] == "\t"
+
+    scan = f"01{GTIN}10INK\t2407\x1d17280930"
+    status, body = _post(scan)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == scan.index("\t")
+    assert scan[body["position"]] == "\t"
+
+
+def test_tab_middle_and_tab_end_have_same_error_code() -> None:
+    for raw in (
+        f"(01){GTIN}(10)AB\tCD(17)280930",
+        f"(01){GTIN}(10)ABCD\t(17)280930",
+        f"01{GTIN}10AB\tCD\x1d17280930",
+        f"01{GTIN}1728093010ABCD\t",
+    ):
+        status, body = _post(raw)
+        assert status == 422, raw
+        assert body["code"] == "unsupported_character", raw
+
+
+# ── GS1 字符集外字符：emoji / NUL / 换行 / DEL / 非 ASCII 文本，稳定拒绝 ──
+
+# (原始输入, 应被定位的字符) —— 覆盖批号 10、序列号 21、企业内部 90～99
+_UNSUPPORTED_CHARS = [
+    ("😀", "emoji U+1F600（星面字符，UTF-16 代理对）"),
+    ("\x00", "NUL"),
+    ("\n", "LF 换行（字段中部，非扫码行尾）"),
+    ("\r", "CR（字段中部）"),
+    ("\x7f", "DEL"),
+    ("é", "拉丁补充字母 é"),
+    ("中", "中文字符"),
+    ("　", "全角空格 U+3000"),
+    ("–", "en dash U+2013"),
+]
+
+
+def test_unsupported_chars_in_lot_rejected_both_formats() -> None:
+    for ch, desc in _UNSUPPORTED_CHARS:
+        readable = f"(01){GTIN}(10)AB{ch}CD(17)280930"
+        status, body = _post(readable)
+        assert status == 422, (desc, "readable")
+        assert body["code"] == "unsupported_character", (desc, "readable")
+        assert body["position"] == readable.index(ch), (desc, "readable")
+        assert readable[body["position"]] == ch
+
+        scan = f"01{GTIN}10AB{ch}CD\x1d17280930"
+        status, body = _post(scan)
+        assert status == 422, (desc, "scan")
+        assert body["code"] == "unsupported_character", (desc, "scan")
+        assert body["position"] == scan.index(ch), (desc, "scan")
+        assert scan[body["position"]] == ch
+
+
+def test_unsupported_chars_in_serial_and_internal_ais_rejected() -> None:
+    """序列号 21 与企业内部 90～99 同样只接受 GS1 字符集。"""
+    for ch, desc in _UNSUPPORTED_CHARS:
+        cases = {
+            "21": f"01{GTIN}21SER{ch}\x1d10L\x1d17280930",
+            "90": f"01{GTIN}10L\x1d90INT{ch}\x1d17280930",
+            "99": f"01{GTIN}10L\x1d99X{ch}\x1d17280930",
+        }
+        for ai, raw in cases.items():
+            status, body = _post(raw)
+            assert status == 422, (ai, desc)
+            assert body["code"] == "unsupported_character", (ai, desc)
+            assert body["position"] == raw.index(ch), (ai, desc, body["position"])
+            assert raw[body["position"]] == ch
+
+
+def test_unsupported_char_in_readable_internal_90_field() -> None:
+    raw = f"(01){GTIN}(10)L(90)内部(17)280930"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == raw.index("内")
+
+
+def test_nul_character_rejected_not_silently_dropped() -> None:
+    """NUL 不得被截断/吞掉后放行剩余内容。"""
+    raw = f"01{GTIN}10AB\x00CD\x1d17280930"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == raw.index("\x00")
+    assert "batch" not in body
+
+
+def test_newline_inside_field_is_not_scanner_suffix() -> None:
+    """只有整串最末尾的 CR/LF 才是行尾；字段中部换行是字符集外字符。"""
+    raw = f"01{GTIN}10AB\nCD\x1d17280930"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == raw.index("\n")
+
+
+def test_emoji_position_is_code_point_aligned() -> None:
+    """emoji 为星面字符（UTF-16 代理对）；位置必须按 Python/JS 码点语义对齐
+    到该字符（index 为码点下标），且按可编码内容计数，绝不识别成功。"""
+    ch = "😀"
+    raw = f"(01){GTIN}(10)LOT{ch}(17)280930"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["position"] == raw.index(ch)
+    assert raw[body["position"]] == ch
+
+
+# ── 长度按可编码标签内容计数 ─────────────────────────────────────────────
+
+def test_length_counts_encodable_chars_not_unicode_codepoints() -> None:
+    """多字节字符在长度检查前即被拒绝，不会因“码点计数”把超界数据判为已识别。"""
+    # 20 个 ASCII 字符恰好为批号上限，识别成功
+    lot20 = "A" * 20
+    status, body = _post(f"(01){GTIN}(10){lot20}(17)280930")
+    assert status == 200
+    assert body["batch"]["lot"] == lot20
+
+    # 21 个 ASCII 字符超界
+    status, body = _post(f"(01){GTIN}(10){'A' * 21}(17)280930")
+    assert status == 422
+    assert "最长 20 位" in body["message"]
+
+    # 19 个可编码字符 + 1 个 emoji：emoji 先被字符集检查拒绝，
+    # 而不是按某种 Unicode 计数放行/误报超长
+    raw = f"(01){GTIN}(10){'A' * 19}😀(17)280930"
+    status, body = _post(raw)
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert raw[body["position"]] == "😀"
+
+
+def test_internal_90_99_length_limits_count_ascii_only() -> None:
+    raw_ok = f"01{GTIN}10L\x1d90{'B' * 30}\x1d17280930"
+    status, body = _post(raw_ok)
+    assert status == 200
+
+    raw_bad = f"01{GTIN}10L\x1d99{'B' * 91}\x1d17280930"
+    status, body = _post(raw_bad)
+    assert status == 422
+    assert "最长 90 位" in body["message"]
+
+
+# ── 错误响应结构：稳定错误代码随响应下发，失败不带批次 ───────────────────
+
+def test_error_response_carries_stable_code() -> None:
+    status, body = _post(f"(01){GTIN}(10)L\t(17)280930")
+    assert status == 422
+    assert body["code"] == "unsupported_character"
+    assert body["errors"][0]["code"] == "unsupported_character"
+    assert isinstance(body["position"], int)
+    assert "batch" not in body
+    assert "fields" not in body
+
+
+def test_structural_error_uses_parse_error_code() -> None:
+    status, body = _post("(05)123456")
+    assert status == 422
+    assert body["code"] == "parse_error"
+    assert body["errors"][0]["code"] == "parse_error"
+
+
+def test_rejected_label_never_returns_batch_partial() -> None:
+    """任一字段字符集外：整次拒绝，响应不含批次信息，也不产生 fields。"""
+    for raw in (
+        f"(01){GTIN}(10)BAD\nLOT(17)280930",
+        f"01{GTIN}10😀\x1d17280930",
+        f"(01){GTIN}(10)L(17)2809😀0",
+    ):
+        status, body = _post(raw)
+        assert status == 422, raw
+        assert body["ok"] is False
+        assert "batch" not in body, raw
+
+
+# ── 合法 ASCII 标签：完整向后兼容 ────────────────────────────────────────
+
+def test_printable_ascii_punctuation_in_variable_fields_accepted() -> None:
+    """GS1 字母数字集允许的可打印 ASCII 标点均可在批号出现（扫描格式无括号定界）。"""
+    lot_punct = "AB12 -_.,/!\"%&*+<>=;"  # 0x20–0x7E 的标点子集（含空格）
+    assert len(lot_punct) == 20
+    raw = f"01{GTIN}10{lot_punct}\x1d17280930"
+    status, body = _post(raw)
+    assert status == 200, raw
+    assert body["batch"]["lot"] == lot_punct
+
+
+def test_existing_legal_labels_still_recognized() -> None:
+    """既有的合法 ASCII 标签（两种格式、AIM 前缀、行尾后缀、FNC1）全部兼容。"""
+    sep_expiry = [
+        (READABLE_OK, "2028-09-30"),
+        (SCAN_OK, "2028-09-30"),
+        (READABLE_OK + "\r\n", "2028-09-30"),
+        (SCAN_OK + "\n", "2028-09-30"),
+        ("]d2" + SCAN_OK, "2028-09-30"),
+        ("]C1" + SCAN_OK, "2028-09-30"),
+        (f"01{GTIN}1728093010INK2407", "2028-09-30"),
+        (f"01{GTIN}10INK2407\x1d21SER998\x1d17280930", "2028-09-30"),
+        (f"(01){GTIN}(10)B-07(17)280200", "2028-02-29"),
+    ]
+    for raw, expires in sep_expiry:
+        status, body = _post(raw)
+        assert status == 200, raw
+        assert body["batch"]["gtin"] == GTIN
+        assert body["batch"]["expires"] == expires
 
 
 # ── 与既有色差端点互不影响 ───────────────────────────────────────────────

@@ -15,6 +15,7 @@ type LabelStatus = "idle" | "recognized" | "rejected";
 interface RejectInfo {
   message: string;
   position: number | null;
+  code?: string;
 }
 
 const STATUS_TEXT: Record<LabelStatus, string> = {
@@ -28,18 +29,46 @@ const FORMAT_TEXT: Record<Gs1LabelFormat, string> = {
   scan: "扫码格式（FNC1 分隔）",
 };
 
-/** 把控制字符可视化（FNC1 → ␝），保持 1:1 字符映射以便按位置切片高亮。 */
-function visibleRaw(raw: string): string {
-  return raw
-    .replace(/\x1d/g, "␝")
-    .replace(/\r/g, "␍")
-    .replace(/\n/g, "␊");
+/**
+ * 把所有不可打印控制字符映射为 U+2400 控制图形区的可见符号（1 码点 → 1 码点），
+ * 使 NUL/换行/TAB 等进入响应后无法再隐身、折行或与普通值同形。
+ * 可打印字符（含空格、emoji）原样保留，因此码点下标与原文严格一致。
+ */
+function visibleChar(ch: string): string {
+  const cp = ch.codePointAt(0) ?? 0;
+  if (cp >= 0x00 && cp <= 0x1f) {
+    return String.fromCodePoint(0x2400 + cp); // ␀..␟（如 NUL→␀, TAB→␉, LF→␊, GS→␝）
+  }
+  if (cp === 0x7f) {
+    return "␡"; // DEL
+  }
+  return ch;
 }
 
-/** 在原文中高亮首个无法解析的位置；位置越出末尾时给出末尾标记。 */
+function visibleRaw(raw: string): string {
+  return Array.from(raw, visibleChar).join("");
+}
+
+/**
+ * 已识别字段值中的空格显示为 ␠（SYMBOL FOR SPACE），使字段首尾与中部的空格
+ * 对收料员可见、可逐字符核对；精确原值通过 title/data-value 保留。
+ */
+function visibleValue(value: string): string {
+  return Array.from(value, (ch) => (ch === " " ? "␠" : visibleChar(ch))).join(
+    "",
+  );
+}
+
+/** 按码点（而非 UTF-16 代码单元）切片，保证 emoji 等星面字符不被代理对拆散。 */
+function sliceCodePoints(text: string, start: number, end?: number): string {
+  const chars = Array.from(text);
+  return chars.slice(start, end).join("");
+}
+
+/** 在原文中高亮首个无法解析的位置（码点对齐）；位置越出末尾时给出末尾标记。 */
 function HighlightedRaw({ raw, position }: { raw: string; position: number }) {
   const shown = visibleRaw(raw);
-  if (position >= shown.length) {
+  if (position >= Array.from(raw).length) {
     return (
       <pre className="raw-highlight" data-testid="label-raw-highlight">
         {shown}
@@ -49,10 +78,29 @@ function HighlightedRaw({ raw, position }: { raw: string; position: number }) {
   }
   return (
     <pre className="raw-highlight" data-testid="label-raw-highlight">
-      {shown.slice(0, position)}
-      <mark data-testid="label-error-char">{shown[position]}</mark>
-      {shown.slice(position + 1)}
+      {sliceCodePoints(shown, 0, position)}
+      <mark data-testid="label-error-char">
+        {Array.from(shown)[position]}
+      </mark>
+      {sliceCodePoints(shown, position + 1)}
     </pre>
+  );
+}
+
+/** 展示一个已识别批次值：空格可见、控制字符不可能出现（后端已拒绝），原值可复核。 */
+function BatchValue({
+  testid,
+  value,
+}: {
+  testid: string;
+  value: string;
+}) {
+  return (
+    <dd data-testid={testid} title={`精确原值（${Array.from(value).length} 个字符）：${visibleValue(value)}`}>
+      <span data-testid={`${testid}-exact`} data-value={value}>
+        {visibleValue(value)}
+      </span>
+    </dd>
   );
 }
 
@@ -96,6 +144,7 @@ export function BatchLabelPanel() {
       setReject({
         message: err?.message ?? `请求失败（HTTP ${outcome.status}）`,
         position: err?.position ?? null,
+        code: err?.code,
       });
     }
   }
@@ -170,6 +219,11 @@ export function BatchLabelPanel() {
       {status === "rejected" && reject && (
         <div className="server-errors" data-testid="label-error" role="alert">
           <strong>{reject.message}</strong>
+          {reject.code === "unsupported_character" && (
+            <div className="error-code" data-testid="label-error-code">
+              错误代码：unsupported_character（GS1 字符集外字符，已整次拒绝，未生成批次信息）
+            </div>
+          )}
           {/* position 可能为 0（首字符即无法解析），必须显式判空，不能用真值判断 */}
           {reject.position !== null && reject.position !== undefined && (
             <div className="error-position" data-testid="label-error-position">
@@ -177,7 +231,13 @@ export function BatchLabelPanel() {
             </div>
           )}
           {reject.position !== null && reject.position !== undefined && (
-            <HighlightedRaw raw={raw} position={reject.position} />
+            <>
+              <HighlightedRaw raw={raw} position={reject.position} />
+              <p className="control-char-note" data-testid="label-control-note">
+                原文中的控制字符按控制图形符号显示（如 ␀=NUL、␉=TAB、␊=换行、␍=回车、␝=FNC1、␡=DEL），
+                不会隐身或折行。
+              </p>
+            </>
           )}
         </div>
       )}
@@ -187,17 +247,25 @@ export function BatchLabelPanel() {
           <dl>
             <div>
               <dt>商品编码 (GTIN)</dt>
-              <dd data-testid="label-gtin">{batch.gtin}</dd>
+              <BatchValue testid="label-gtin" value={batch.gtin} />
             </div>
             <div>
               <dt>批号</dt>
-              <dd data-testid="label-lot">{batch.lot}</dd>
+              <BatchValue testid="label-lot" value={batch.lot} />
             </div>
             <div>
               <dt>失效日期</dt>
-              <dd data-testid="label-expires">{batch.expires}</dd>
+              <BatchValue testid="label-expires" value={batch.expires} />
             </div>
           </dl>
+          {(batch.gtin.includes(" ") ||
+            batch.lot.includes(" ") ||
+            batch.expires.includes(" ")) && (
+            <p className="value-space-note" data-testid="label-space-note">
+              值中的 <span className="space-glyph">␠</span> 表示真实空格字符（含字段首尾空格），
+              悬停可查看精确原值与字符数。
+            </p>
+          )}
         </div>
       )}
     </section>

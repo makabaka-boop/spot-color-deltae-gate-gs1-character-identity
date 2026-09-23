@@ -8,7 +8,9 @@ import { defineConfig, devices } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./e2e",
-  timeout: 30_000,
+  // 单用例默认 60s：低端 CI（如 arm64 容器内的 headless shell）单次提交较慢；
+  // 多次串行提交的用例会在文件内用 test.setTimeout 再放宽。
+  timeout: 60_000,
   fullyParallel: false,
   workers: 1,
   reporter: [["list"]],

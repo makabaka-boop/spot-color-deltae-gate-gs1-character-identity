@@ -345,3 +345,23 @@ button:disabled {
   font-variant-numeric: tabular-nums;
   word-break: break-all;
 }
+
+/* 空格/控制字符的可见化标记 */
+.space-glyph {
+  font-weight: 700;
+  color: #1d6f42;
+}
+
+.value-space-note,
+.control-char-note {
+  margin: 8px 0 0;
+  font-size: 12px;
+  color: #5a6573;
+}
+
+.error-code {
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #8f2020;
+}

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BatchLabelPanel } from "./BatchLabelPanel";
@@ -282,8 +282,9 @@ describe("批次标签核验区状态机", () => {
     mockResponse(async () =>
       jsonResponse(422, {
         ok: false,
+        code: "parse_error",
         message: "标签解析失败：标签缺少批次核验必需的 AI (01) 商品编码 GTIN",
-        errors: [{ field: "raw", message: "缺少 AI (01)", type: "parse_error" }],
+        errors: [{ field: "raw", message: "缺少 AI (01)", type: "parse_error", code: "parse_error" }],
         position: noGtin.length,
       }),
     );
@@ -294,5 +295,142 @@ describe("批次标签核验区状态机", () => {
 
     expect(await screen.findByTestId("label-error")).toBeInTheDocument();
     expect(screen.getByTestId("label-error-char")).toHaveTextContent("末尾");
+  });
+
+  it("尾随空格是批号身份：已识别结果把空格显示为 ␠，精确原值保留在 data-value", async () => {
+    const user = userEvent.setup();
+    const raw = "01095060001343521728093010INK2407 ";
+    mockResponse(async () =>
+      jsonResponse(200, {
+        ok: true,
+        format: "scan",
+        fields: [],
+        batch: { gtin: "09506000134352", lot: "INK2407 ", expires: "2028-09-30" },
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), raw);
+    await user.click(screen.getByTestId("label-verify"));
+
+    expect(await screen.findByTestId("label-result")).toBeInTheDocument();
+    // 页面可见文本中尾随空格不再隐身：显示为 ␠
+    expect(screen.getByTestId("label-lot")).toHaveTextContent("INK2407␠");
+    // 精确原值（含真实尾随空格）保留给机器/悬停核对
+    expect(screen.getByTestId("label-lot-exact")).toHaveAttribute(
+      "data-value",
+      "INK2407 ",
+    );
+    expect(screen.getByTestId("label-space-note")).toBeInTheDocument();
+  });
+
+  it("字段中部与字段末尾 TAB 均被稳定拒绝：错误代码 unsupported_character，TAB 显示为 ␉", async () => {
+    const user = userEvent.setup();
+    const cases = [
+      { raw: "(01)09506000134352(10)AB\tCD(17)280930", pos: 24 }, // 中部 TAB
+      { raw: "(01)09506000134352(17)280930(10)ABCD\t", pos: 36 }, // 末尾 TAB
+    ];
+    for (const { raw, pos } of cases) {
+      mockResponse(async () =>
+        jsonResponse(422, {
+          ok: false,
+          code: "unsupported_character",
+          message: "标签解析失败：AI (10) 批号含 GS1 字符集外字符：U+0009 TAB",
+          errors: [
+            {
+              field: "raw",
+              message: "U+0009 TAB",
+              type: "parse_error",
+              code: "unsupported_character",
+            },
+          ],
+          position: pos,
+        }),
+      );
+
+      const { unmount } = render(<BatchLabelPanel />);
+      await user.type(screen.getByTestId("label-raw"), raw);
+      await user.click(screen.getByTestId("label-verify"));
+
+      expect(await screen.findByTestId("label-error")).toBeInTheDocument();
+      expect(screen.getByTestId("label-status")).toHaveTextContent("已拒绝");
+      expect(screen.getByTestId("label-error-code")).toHaveTextContent(
+        "unsupported_character",
+      );
+      expect(screen.getByTestId("label-error-position")).toHaveTextContent(
+        `第 ${pos + 1} 个字符`,
+      );
+      // TAB 在结果区可见为 ␉，不再被吞成空白/不可辨认
+      expect(screen.getByTestId("label-error-char")).toHaveTextContent("␉");
+      // 拒绝状态不产生批次结果
+      expect(screen.queryByTestId("label-result")).not.toBeInTheDocument();
+      unmount();
+    }
+  });
+
+  it("emoji（星面字符）位于错误位置：按码点切片，代理对不被拆散，emoji 本身被标记", async () => {
+    const user = userEvent.setup();
+    // 批号 LOT😀：emoji 是单个码点（两个 UTF-16 单元），位置 25
+    const raw = "(01)09506000134352(10)LOT😀(17)280930";
+    const pos = Array.from(raw).indexOf("😀");
+    mockResponse(async () =>
+      jsonResponse(422, {
+        ok: false,
+        code: "unsupported_character",
+        message: "标签解析失败：含 GS1 字符集外字符 U+1F600",
+        errors: [
+          {
+            field: "raw",
+            message: "U+1F600",
+            type: "parse_error",
+            code: "unsupported_character",
+          },
+        ],
+        position: pos,
+      }),
+    );
+
+    render(<BatchLabelPanel />);
+    await user.type(screen.getByTestId("label-raw"), raw);
+    await user.click(screen.getByTestId("label-verify"));
+
+    expect(await screen.findByTestId("label-error")).toBeInTheDocument();
+    expect(screen.getByTestId("label-error-char")).toHaveTextContent("😀");
+    // 高亮块完整保留 emoji，不出现替身分两半的情况
+    expect(screen.getByTestId("label-raw-highlight")).toHaveTextContent(raw);
+  });
+
+  it("NUL 与换行被拒绝时可见化为 ␀ / ␊，不隐身、不折行成普通值", async () => {
+    const user = userEvent.setup();
+    const cases: Array<{ raw: string; pos: number; glyph: string }> = [
+      { raw: "010950600013435210AB\x00CD\x1d17280930", pos: 20, glyph: "␀" },
+      { raw: "010950600013435210AB\nCD\x1d17280930", pos: 20, glyph: "␊" },
+    ];
+    for (const { raw, pos, glyph } of cases) {
+      mockResponse(async () =>
+        jsonResponse(422, {
+          ok: false,
+          code: "unsupported_character",
+          message: "标签解析失败：GS1 字符集外字符",
+          errors: [
+            { field: "raw", message: "ctrl", type: "parse_error", code: "unsupported_character" },
+          ],
+          position: pos,
+        }),
+      );
+
+      const { unmount } = render(<BatchLabelPanel />);
+      // userEvent 对 NUL/换行的键入不稳定，直接用 fireEvent 改变 textarea 值
+      const ta = screen.getByTestId("label-raw") as HTMLTextAreaElement;
+      await user.click(ta);
+      await user.clear(ta);
+      fireEvent.change(ta, { target: { value: raw } });
+      await user.click(screen.getByTestId("label-verify"));
+
+      expect(await screen.findByTestId("label-error")).toBeInTheDocument();
+      expect(screen.getByTestId("label-error-char")).toHaveTextContent(glyph);
+      expect(screen.queryByTestId("label-result")).not.toBeInTheDocument();
+      unmount();
+    }
   });
 });

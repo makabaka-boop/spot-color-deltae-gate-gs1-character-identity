@@ -19,7 +19,11 @@ export type LabForm = Record<ColorKey, LabInput>;
 export interface FieldError {
   field: string;
   message: string;
+  code?: string;
 }
+
+/** 稳定错误代码：unsupported_character = GS1 字符集外字符；其余为 parse_error。 */
+export type Gs1ErrorCode = "unsupported_character" | "parse_error";
 
 export interface DeltaEResult {
   delta_e00: number;
@@ -71,9 +75,11 @@ export interface Gs1LabelSuccessResponse {
 
 export interface Gs1LabelErrorResponse {
   ok: false;
+  /** 稳定机器可读错误代码（字符集外字符为 unsupported_character） */
+  code?: Gs1ErrorCode;
   message: string;
   errors: FieldError[];
-  /** 首个无法解析的字符在原文中的下标（0 起）；无法定位时为 null */
+  /** 首个无法解析的字符在原文中的下标（0 起，码点对齐）；无法定位时为 null */
   position: number | null;
 }
 
